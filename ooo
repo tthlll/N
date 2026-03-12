@@ -1,0 +1,220 @@
+import tensorflow as tf
+
+import tensorlayer as tl
+from collections import deque
+import numpy as np
+import gymnasium as gym
+import random
+
+
+class Bayesian_Double_DQN:
+    def __init__(self):
+        self.env = gym.make('CartPole-v1', render_mode="rgb_array")
+        self.input_dim = self.env.observation_space.shape[0]
+        self.action_dim = self.env.action_space.n
+
+        # 在线网络 / 目标网络
+        self.Q_network = self.get_model()
+        self.Q_network.train()
+
+        self.target_Q_network = self.get_model()
+        self.target_Q_network.eval()
+        self.update_target_Q()
+
+        # epsilon-greedy 仍然保留；其中 greedy 分支改为“高斯采样后选最大”
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+
+        # 其余超参数
+        self.memory = deque(maxlen=2000)
+        self.batch = 128
+        self.gamma = 0.95
+        self.learning_rate = 1e-3
+        self.opt = tf.optimizers.Adam(self.learning_rate)
+        self.is_rend = False
+
+        # 数值稳定
+        self.min_log_std = -5.0
+        self.max_log_std = 2.0
+
+    def get_model(self):
+        """
+        输出每个动作对应的高斯分布参数:
+        mu:      [batch, action_dim]
+        log_std: [batch, action_dim]
+        """
+        inputs = tl.layers.Input(shape=[None, self.input_dim])
+        h1 = tl.layers.Dense(
+            32, tf.nn.relu, W_init=tf.initializers.GlorotUniform()
+        )(inputs)
+        h2 = tl.layers.Dense(
+            16, tf.nn.relu, W_init=tf.initializers.GlorotUniform()
+        )(h1)
+
+        mu = tl.layers.Dense(
+            self.action_dim, act=None, W_init=tf.initializers.GlorotUniform()
+        )(h2)
+
+        log_std = tl.layers.Dense(
+            self.action_dim, act=None, W_init=tf.initializers.GlorotUniform()
+        )(h2)
+
+        return tl.models.Model(inputs=inputs, outputs=[mu, log_std])
+
+    def update_epsilon(self):
+        if self.epsilon >= self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            self.epsilon = max(self.epsilon, self.epsilon_min)
+
+    def update_target_Q(self):
+        for src, tgt in zip(
+            self.Q_network.trainable_weights,
+            self.target_Q_network.trainable_weights
+        ):
+            tgt.assign(src)
+
+    def remember(self, s, a, s_, r, done):
+        s = np.array(s, dtype=np.float32).flatten()
+        s_ = np.array(s_, dtype=np.float32).flatten()
+        self.memory.append((s, a, s_, r, done))
+
+    def sample_q(self, mu, log_std):
+        """
+        从高斯分布采样Q值:
+        Q ~ N(mu, sigma^2)
+        """
+        log_std = tf.clip_by_value(log_std, self.min_log_std, self.max_log_std)
+        std = tf.exp(log_std)
+        eps = tf.random.normal(shape=tf.shape(mu))
+        return mu + std * eps
+
+    def gaussian_nll(self, target, mu, log_std):
+        """
+        对单个动作的目标值做 Gaussian NLL:
+        0.5 * [ ((y-mu)^2 / sigma^2) + log(sigma^2) ]
+        """
+        log_std = tf.clip_by_value(log_std, self.min_log_std, self.max_log_std)
+        var = tf.exp(2.0 * log_std)
+        loss = 0.5 * (((target - mu) ** 2) / (var + 1e-6) + tf.math.log(var + 1e-6))
+        return tf.reduce_mean(loss)
+
+    def process_data(self):
+        """
+        生成训练 batch:
+        s          : 当前状态
+        a          : 当前动作
+        target_y   : Bellman target
+        """
+        data = random.sample(self.memory, self.batch)
+
+        s = np.array([d[0] for d in data], dtype=np.float32)
+        a = np.array([d[1] for d in data], dtype=np.int32)
+        s_ = np.array([d[2] for d in data], dtype=np.float32)
+        r = np.array([d[3] for d in data], dtype=np.float32)
+        done = np.array([d[4] for d in data], dtype=np.float32)
+
+        # online network: 用于选择 next_action（Double DQN 的“提案”网络）
+        next_mu_online, next_log_std_online = self.Q_network(s_)
+        next_q_online_sample = self.sample_q(next_mu_online, next_log_std_online)
+        next_action = tf.argmax(next_q_online_sample, axis=1, output_type=tf.int32)
+
+        # target network: 用于评估 next_action（Double DQN 的“执行”网络）
+        next_mu_target, _ = self.target_Q_network(s_)
+
+        batch_index = tf.range(self.batch, dtype=tf.int32)
+        gather_index = tf.stack([batch_index, next_action], axis=1)
+
+        next_q_target = tf.gather_nd(next_mu_target, gather_index)
+
+        # Bellman target
+        target_y = r + (1.0 - done) * self.gamma * next_q_target.numpy()
+
+        return s, a, target_y.astype(np.float32)
+
+    def update_Q_network(self):
+        """
+        用 Gaussian NLL 更新在线Q网络
+        只对 batch 中“被执行动作”的分布参数进行监督
+        """
+        s, a, target_y = self.process_data()
+
+        s = tf.convert_to_tensor(s, dtype=tf.float32)
+        a = tf.convert_to_tensor(a, dtype=tf.int32)
+        target_y = tf.convert_to_tensor(target_y, dtype=tf.float32)
+
+        with tf.GradientTape() as tape:
+            mu, log_std = self.Q_network(s)
+
+            batch_index = tf.range(tf.shape(a)[0], dtype=tf.int32)
+            gather_index = tf.stack([batch_index, a], axis=1)
+
+            chosen_mu = tf.gather_nd(mu, gather_index)
+            chosen_log_std = tf.gather_nd(log_std, gather_index)
+
+            loss = self.gaussian_nll(target_y, chosen_mu, chosen_log_std)
+
+        grads = tape.gradient(loss, self.Q_network.trainable_weights)
+        self.opt.apply_gradients(zip(grads, self.Q_network.trainable_weights))
+
+        return float(loss.numpy())
+
+    def get_action(self, s):
+        """
+        动作选择:
+        - 以 epsilon 概率随机探索
+        - 否则，从 Q 的高斯分布采样后取 argmax
+        """
+        s = np.array(s, dtype=np.float32).reshape([-1, self.input_dim])
+
+        if np.random.rand() >= self.epsilon:
+            mu, log_std = self.Q_network(s)
+            q_sample = self.sample_q(mu, log_std)
+            a = int(tf.argmax(q_sample[0]).numpy())
+            return a
+        else:
+            return random.randint(0, self.action_dim - 1)
+
+    def train(self, episode):
+        step = 0
+
+        for ep in range(episode):
+            s, _ = self.env.reset()
+            total_reward = 0.0
+            total_loss = []
+
+            while True:
+                if self.is_rend:
+                    self.env.render()
+
+                a = self.get_action(s)
+                s_, r, terminated, truncated, _ = self.env.step(a)
+                done = terminated or truncated
+
+                total_reward += r
+                step += 1
+
+                s_ = np.array(s_, dtype=np.float32).flatten()
+                self.remember(s, a, s_, r, done)
+                s = s_
+
+                if len(self.memory) > self.batch:
+                    loss = self.update_Q_network()
+                    total_loss.append(loss)
+
+                if (step + 1) % 10 == 0:
+                    self.update_epsilon()
+                    self.update_target_Q()
+
+                if done:
+                    mean_loss = np.mean(total_loss) if len(total_loss) > 0 else 0.0
+                    print(
+                        'EP:%i, total_rewards:%f, epsilon:%f, loss:%f'
+                        % (ep, total_reward, self.epsilon, mean_loss)
+                    )
+                    break
+
+
+if __name__ == '__main__':
+    bdqn = Bayesian_Double_DQN()
+    bdqn.train(200)
