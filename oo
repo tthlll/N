@@ -1,182 +1,64 @@
-import tensorflow as tf
-import tensorlayer as tl
-from collections import deque
+import matlab
+import matlab.engine
 import numpy as np
-import gymnasium as gym
-import random
+import time
 
-
-class Double_DQN():
+class SimulinkDY(object):
     def __init__(self):
-        self.env = gym.make('CartPole-v1', render_mode="rgb_array")  # 定义环境
-        self.input_dim = self.env.observation_space.shape[0]  # 定义网络的输入形状，这里就是输入S
+        self.T=0.000001
+        self.dt=0.000001
+        self.R0=0.0001
+        self.L0=0.003
+        self.R1=0
+        self.L1=0
+        self.R2=0
+        self.L2=0
+        self.Sa=[]
+        self.Sa1=[]
+        self.Sb=[]
+        self.Sb1=[]
+        self.Sa_np=[]
+        self.Sb_np=[]
+        self.R=[]
+        self.R_np=[]
+        self.Rall=[]
+        self.eng = matlab.engine.start_matlab("-desktop")  #启动matlab
+        self.env_name = 'Dai_Suo_You_Mo_Kuai'  #simulink模型名称
+        self.eng.load_system(self.env_name, nargout=0)  #加载模型
+        self.eng.set_param(self.env_name, 'StopTime', str(10), nargout=0)
+        #self.eng.set_param(self.env_name, 'FixedStep', str(0.001), nargout=0)  # 固定步长
+        self.eng.set_param(self.env_name + '/T', 'Value', str(self.T), nargout=0)
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块A/LA', 'Value', str(self.L0), nargout=0) #设置模块参数
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块A/RA', 'Value', str(self.R0), nargout=0)  # 设置模块参数
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块B/LB', 'Value', str(self.L0), nargout=0)  # 设置模块参数
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块B/RB', 'Value', str(self.R0), nargout=0)  # 设置模块参数
+        self.eng.set_param(self.env_name, 'SimulationCommand', 'start', nargout=0) #开始仿真
+        time.sleep(1)#延时
+        self.sim_status, _ = self.eng.set_param(self.env_name, 'SimulationStatus') #获取当前仿真状态
 
-        # 建立两个网络
-        self.Q_network = self.get_model()  # 建立一个Q网络
-        self.Q_network.train()  # 在tensorlayer要指定这个网络用于训练。
-        self.target_Q_network = self.get_model()  # 创建一个target_Q网络
-        self.target_Q_network.eval()  # 这个网络指定为不用于更新。
+    def stop(self):
+        self.eng.set_param(self.env_name, 'SimulationCommand', 'stop', nargout=0)
+        self.eng.quit()
 
-        ## epsilon-greedy相关参数
-        self.epsilon = 1.0  # epsilon大小，随机数大于epsilon，则进行开发；否则，进行探索。
-        self.epsilon_decay = 0.995  # 减少率：epsilon会随着迭代而更新，每次会乘以0.995
-        self.epsilon_min = 0.01  # 小于最小epsilon就不再减少了。
-
-        # 其余超参数
-        self.memory = deque(maxlen=2000)  # 队列，最大值是2000
-        self.batch = 128
-        self.gamma = 0.95  # 折扣率
-        self.learning_rate = 1e-3  # 学习率
-        self.opt = tf.optimizers.Adam(self.learning_rate)  # 优化器
-        self.is_rend = False  # 默认不渲染，当达到一定次数后，开始渲染。
-
-
-    def get_model(self):
-        #创建网络
-        #    输入：S
-        #    输出：所有动作的Q值
-        self.input = tl.layers.Input(shape=[None,self.input_dim])
-        self.h1 = tl.layers.Dense(32, tf.nn.relu, W_init=tf.initializers.GlorotUniform())(self.input)
-        self.h2 = tl.layers.Dense(16, tf.nn.relu, W_init=tf.initializers.GlorotUniform())(self.h1)
-        self.output = tl.layers.Dense(2, act=None, W_init=tf.initializers.GlorotUniform())(self.h2)
-        return tl.models.Model(inputs=self.input, outputs=self.output)
-    
-    def update_epsilon(self):
-        '''
-        用于更新epsilon
-            除非已经epsilon_min还小，否则比每次都乘以减少率epsilon_decay。
-        '''
-        if self.epsilon >= self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-    def update_target_Q(self):
-        '''
-        Q网络学习完之后，需要把参数赋值到target_Q网络
-        '''
-        for i, target in zip(self.Q_network.trainable_weights, self.target_Q_network.trainable_weights):
-            target.assign(i)
-
-    def remember(self, s, a, s_, r, done):
-        #经验回放
-        # 确保状态是一维数组
-        s = np.array(s, dtype=np.float32).flatten()  # 确保是1D
-        s_ = np.array(s_, dtype=np.float32).flatten()  # 确保是1D
-
-        # 检查维度
-        if len(s.shape) > 1 or len(s_.shape) > 1:
-            s = s.flatten()
-            s_ = s_.flatten()
-
-        self.memory.append((s, a, s_, r, done))
-
-    def process_data(self):
-        #目标网络找到标签
-
-        # 从队列中，随机取出一个batch大小的数据。
-        data = random.sample(self.memory, self.batch)
-        s = np.array([d[0] for d in data])
-        a = [d[1] for d in data]
-        s_ = np.array([d[2] for d in data])
-        r = [d[3] for d in data]
-        done = [d[4] for d in data]
-
-       
-        # 计算Double的target
-        y = self.Q_network(np.array(s, dtype='float32'))
-        y = y.numpy()
-        Q1 = self.target_Q_network(np.array(s_, dtype='float32'))
-        Q2 = self.Q_network(np.array(s_, dtype='float32'))
-        next_action = np.argmax(Q2, axis=1)#输出的是最大数据的索引
-
-        for i, (_, a, _, r, done) in enumerate(data):
-            if done:
-                target = r
-            else:
-                # [敲黑板]
-                # next_action是从Q_network计算出来的最大Q值的动作
-                # 但输出的，是target_Q_network中的next_action的Q值。
-                # 可以理解为：一个网络提议案，另外一个网络进行执行
-                target = r + self.gamma * Q1[i][next_action[i]]
-            target = np.array(target, dtype='float32')
-
-            # y 就是更新目标。
-            y[i][a] = target
-        return s, y
-
-    def update_Q_network(self):
-        '''
-        更新Q_network，最小化target和Q的距离
-        '''
-        s, y = self.process_data()
-        with tf.GradientTape() as tape:
-            Q = self.Q_network(np.array(s, dtype='float32'))
-            loss = tl.cost.mean_squared_error(Q, y)  # 最小化target和Q的距离
-        grads = tape.gradient(loss, self.Q_network.trainable_weights)
-        self.opt.apply_gradients(zip(grads, self.Q_network.trainable_weights))
-        return loss
-
-    def get_action(self, s):
-        '''
-        用epsilon-greedy的方式求动作。
-        '''
-        # 先随机一个数，如果比epsilon大，那么，就输出最大Q值的动作。
-        if np.random.rand() >= self.epsilon:
-            q = self.Q_network(np.array(s, dtype='float32').reshape([-1, 4]))
-            a = np.argmax(q)
-            return a
-        # 否则，随机一个动作输出。
-        else:
-            a = random.randint(0, 1)
-            return a
-
-    ## 开始训练
-    def train(self, episode):
-        step = 0
-        rend = 0
-        for ep in range(episode):
-
-            s, _ = self.env.reset()  # 重置初始状态s
-            total_reward = 0
-            total_loss = []
-            loss = 0
-
-            while True:
-                if self.is_rend: self.env.render()
-
-                # 进行游戏
-                a = self.get_action(s)
-                s_, r, terminated, truncated, _ = self.env.step(a)
-                done = terminated or truncated  # 组合两种结束条件
-                total_reward += r
-                step += 1
-
-                # 保存s, a, s_, r, done
-                s_ = np.array(s_, dtype=np.float32).flatten()
-                self.remember(s, a, s_, r, done)
-                s = s_
-
-                # 如果数据足够，那么就开始更新
-                if len(self.memory) > self.batch:
-                    loss = self.update_Q_network()
-                    total_loss.append(loss)
-                    if (step + 1) % 10 == 0:
-                        self.update_epsilon()
-                        self.update_target_Q()
-
-                # 如果到最终状态，就打印一下成绩如何
-                if done:
-                    print('EP:%i,  total_rewards:%f,   epsilon:%f, loss:%f' % (
-                    ep, total_reward, self.epsilon, np.mean(loss)))
-                    break
-
-            # 如果有5个ep成绩大于200，就开始渲染游戏。
-            # if total_reward >= 200:
-            #     rend += 1
-            #     if rend == 5:
-            #         self.is_rend = True
-
-
-# 开始运行游戏
-if __name__ == '__main__':
-    ddqn = Double_DQN()
-    ddqn.train(200)
+    def start(self, A1, A2):
+        self.R1 = self.R0 + A1[0]
+        self.L1 = self.L0 + A1[1]
+        self.R2 = self.R0 + A2[0]
+        self.L2 = self.L0 + A2[1]
+        self.T=self.T+self.dt
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块A/RA', 'Value', str(self.R1), nargout=0)
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块A/LA', 'Value', str(self.L1), nargout=0)
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块B/RB', 'Value', str(self.R2), nargout=0)
+        self.eng.set_param(self.env_name + '/虚拟阻抗添加模块B/LB', 'Value', str(self.L2), nargout=0)
+        self.eng.set_param(self.env_name + '/T', 'Value', str(self.T), nargout=0)
+        time.sleep(1)
+        self.eng.set_param(self.env_name, 'SimulationCommand', 'continue', nargout=0)
+        time.sleep(1)
+        self.Sa = self.eng.workspace['Sa']
+        self.Sa_np = np.array(self.Sa).flatten()
+        self.Sa1 = self.Sa_np[-1] #逆变器1状态数据
+        self.Sb = self.eng.workspace['Sb']
+        self.Sb_np = np.array(self.Sb).flatten()
+        self.Sb1 = self.Sb_np[-1]#逆变器2状态数据
+        self.R = self.eng.workspace['R']
+        self.R_np = np.array(self.R).flatten()
